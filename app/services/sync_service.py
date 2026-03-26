@@ -121,15 +121,41 @@ class SyncService:
         source_status_col = source_header_mapping[columns.statusColumn]
         source_juridical_col = source_header_mapping[columns.juridicalColumn]
 
+        # F = 6-я колонка => индекс 5
+        wb_activity_col = 5
+
+        # CG = 85-я колонка => индекс 84
+        ozon_flag_col = 84
+
+        platform_type = (request.platformType or "").strip().upper()
+        project_name = (request.projectName or "").strip().upper()
+
         barcodes_set: set[str] = set()
+
         for row in data[source_header_row_index:]:
             barcode = _cell(row, source_barcode_col).strip()
             status = _cell(row, source_status_col).strip()
             juridical = _cell(row, source_juridical_col).strip()
+
             if not barcode or juridical != request.filters.juridicalPerson:
                 continue
+
             if status in request.filters.excludeStatuses:
                 continue
+
+            is_wb = platform_type == "WB" or "WB" in project_name
+            is_ozon = platform_type == "OZON" or "OZON" in project_name or "ОЗОН" in project_name
+
+            if is_wb:
+                wb_activity = _cell(row, wb_activity_col).strip()
+                if wb_activity == "Старьё":
+                    continue
+
+            if is_ozon:
+                ozon_flag = _cell(row, ozon_flag_col).strip()
+                if ozon_flag == "Нет на ОЗОН":
+                    continue
+
             barcodes_set.add(barcode)
 
         return SourceInfo(
