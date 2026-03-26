@@ -15,7 +15,12 @@ from app.models import SyncRequest
 from app.services.sheets_client import GoogleApiSheetsClient
 from app.services.sync_service import SyncService
 
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+
+logger = logging.getLogger("uvicorn.error")
 
 
 class SyncAcceptedResponse(BaseModel):

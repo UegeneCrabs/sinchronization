@@ -27,7 +27,7 @@ class SourceInfo:
 class SyncService:
     def __init__(self, sheets_client: SheetsClient) -> None:
         self.sheets_client = sheets_client
-        self.logger = logging.getLogger(__name__)
+        self.logger = logging.getLogger("uvicorn.error")
 
     def run(self, request: SyncRequest) -> SyncResponse:
         started_at = datetime.now(timezone.utc)
