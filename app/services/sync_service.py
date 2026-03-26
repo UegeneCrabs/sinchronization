@@ -166,7 +166,7 @@ class SyncService:
         )
 
     def _process_target(
-        self, request: SyncRequest, target: TargetConfig, source_info: SourceInfo
+            self, request: SyncRequest, target: TargetConfig, source_info: SourceInfo
     ) -> SheetSyncResult:
         target_data = self.sheets_client.read_sheet(str(target.spreadsheetUrl), target.sheetName)
         if not target_data:
@@ -184,6 +184,7 @@ class SyncService:
 
         working_data = [row[:] for row in target_data]
         orange_cells: set[tuple[int, int]] = set()
+        added_products_count = 0
 
         source_barcode_col = source_info.header_mapping[request.filters.columnNames.barcodeColumn]
         source_status_col = source_info.header_mapping[request.filters.columnNames.statusColumn]
@@ -193,6 +194,7 @@ class SyncService:
             src_bc = _cell(src_row, source_barcode_col).strip()
             src_status = _cell(src_row, source_status_col).strip()
             src_juridical = _cell(src_row, source_juridical_col).strip()
+
             if not src_bc or src_juridical != request.filters.juridicalPerson:
                 continue
             if src_status in request.filters.excludeStatuses:
@@ -207,6 +209,7 @@ class SyncService:
             if src_bc in target_barcode_map:
                 row_idx = target_barcode_map[src_bc]
                 _ensure_width(working_data[row_idx], _max_col(target_header_mapping) + 1)
+
                 for key, new_value in new_values.items():
                     col_idx = target_header_mapping[key]
                     old_value = _cell(working_data[row_idx], col_idx).strip()
@@ -218,11 +221,14 @@ class SyncService:
                     working_data, target_header_row_index, barcode_col_target
                 )
                 _ensure_width(working_data[row_idx], _max_col(target_header_mapping) + 1)
+
                 for key, new_value in new_values.items():
                     col_idx = target_header_mapping[key]
                     working_data[row_idx][col_idx] = new_value
                     orange_cells.add((row_idx, col_idx))
+
                 target_barcode_map[src_bc] = row_idx
+                added_products_count += 1
 
         missing_cells = self._find_missing_barcodes(
             data=working_data,
@@ -257,8 +263,19 @@ class SyncService:
                 ),
             )
             self.sheets_client.write_sheet(
-                spreadsheet_url=str(target.spreadsheetUrl), sheet_name=target.sheetName, payload=payload
+                spreadsheet_url=str(target.spreadsheetUrl),
+                sheet_name=target.sheetName,
+                payload=payload,
             )
+
+        self.logger.info(
+            "sheet_processed sheet=%s added_products=%s red_marked=%s duplicates=%s orange_cells=%s",
+            target.sheetName,
+            added_products_count,
+            len(missing_cells),
+            len(duplicate_cells),
+            len(orange_cells),
+        )
 
         return SheetSyncResult(
             sheetName=target.sheetName,
