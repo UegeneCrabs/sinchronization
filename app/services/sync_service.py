@@ -247,6 +247,10 @@ class SyncService:
                 ],
                 background_updates=self._build_style_updates(
                     include_coloring=request.options.includeColoring,
+                    working_data=working_data,
+                    target_header_mapping=target_header_mapping,
+                    target_header_row_index=target_header_row_index,
+                    target_mapping=target.mapping,
                     orange_cells=orange_cells,
                     missing_cells=missing_cells,
                     duplicate_cells=duplicate_cells,
@@ -312,19 +316,47 @@ class SyncService:
 
     @staticmethod
     def _build_style_updates(
-        include_coloring: bool,
-        orange_cells: set[tuple[int, int]],
-        missing_cells: set[tuple[int, int]],
-        duplicate_cells: set[tuple[int, int]],
+            include_coloring: bool,
+            working_data: list[list],
+            target_header_mapping: dict[str, int],
+            target_header_row_index: int,
+            target_mapping: dict[str, str],
+            orange_cells: set[tuple[int, int]],
+            missing_cells: set[tuple[int, int]],
+            duplicate_cells: set[tuple[int, int]],
     ) -> list[CellStyleUpdate]:
         if not include_coloring:
             return []
-        updates = [CellStyleUpdate(row=row, col=col, color="orange") for row, col in sorted(orange_cells)]
-        updates.extend(CellStyleUpdate(row=row, col=col, color="red") for row, col in sorted(missing_cells))
-        updates.extend(
-            CellStyleUpdate(row=row, col=col, color="lightblue") for row, col in sorted(duplicate_cells)
-        )
-        return updates
+
+        color_map: dict[tuple[int, int], str] = {}
+
+        # Сначала красим в белый все целевые столбцы из target.mapping
+        target_cols: list[int] = []
+        for target_field in target_mapping.keys():
+            col_idx = target_header_mapping.get(target_field)
+            if col_idx is not None:
+                target_cols.append(col_idx)
+
+        target_cols = sorted(set(target_cols))
+
+        for row_idx in range(target_header_row_index, len(working_data)):
+            for col_idx in target_cols:
+                color_map[(row_idx, col_idx)] = "white"
+
+        # Потом поверх накладываем остальные цвета
+        for row_idx, col_idx in orange_cells:
+            color_map[(row_idx, col_idx)] = "orange"
+
+        for row_idx, col_idx in missing_cells:
+            color_map[(row_idx, col_idx)] = "red"
+
+        for row_idx, col_idx in duplicate_cells:
+            color_map[(row_idx, col_idx)] = "lightblue"
+
+        return [
+            CellStyleUpdate(row=row, col=col, color=color)
+            for (row, col), color in sorted(color_map.items())
+        ]
 
 
 def _cell(row: list, index: int) -> str:
