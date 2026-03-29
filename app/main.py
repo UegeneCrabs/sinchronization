@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -21,6 +22,8 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("uvicorn.error")
+
+JOB_WORKERS = int(os.getenv("SYNC_JOB_WORKERS", "2"))
 
 
 class SyncAcceptedResponse(BaseModel):
@@ -48,12 +51,21 @@ class SyncJob:
     error: str | None = None
 
 
-async def worker_loop(app: FastAPI) -> None:
+async def worker_loop(app: FastAPI, worker_no: int) -> None:
+    logger.info("sync_worker_started worker_no=%s", worker_no)
+
     while True:
         job_id = await app.state.job_queue.get()
         job: SyncJob = app.state.jobs[job_id]
 
         try:
+            logger.info(
+                "sync_job_picked worker_no=%s job_id=%s queue_size=%s",
+                worker_no,
+                job_id,
+                app.state.job_queue.qsize(),
+            )
+
             job.status = "running"
             job.started_at = datetime.now(timezone.utc).isoformat()
 
@@ -61,8 +73,20 @@ async def worker_loop(app: FastAPI) -> None:
 
             job.status = "done"
             job.finished_at = datetime.now(timezone.utc).isoformat()
+
+            logger.info(
+                "sync_job_done worker_no=%s job_id=%s duration_started_at=%s finished_at=%s",
+                worker_no,
+                job_id,
+                job.started_at,
+                job.finished_at,
+            )
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Background sync failed for job_id=%s", job_id)
+            logger.exception(
+                "Background sync failed for worker_no=%s job_id=%s",
+                worker_no,
+                job_id,
+            )
             job.status = "failed"
             job.error = str(exc)
             job.finished_at = datetime.now(timezone.utc).isoformat()
@@ -76,15 +100,23 @@ async def lifespan(app: FastAPI):
     app.state.job_queue: asyncio.Queue[str] = asyncio.Queue()
     app.state.jobs: dict[str, SyncJob] = {}
 
-    app.state.worker_task = asyncio.create_task(worker_loop(app))
+    app.state.worker_tasks = [
+        asyncio.create_task(worker_loop(app, worker_no=i + 1))
+        for i in range(JOB_WORKERS)
+    ]
+
+    logger.info("sync_workers_initialized workers=%s", JOB_WORKERS)
+
     try:
         yield
     finally:
-        app.state.worker_task.cancel()
-        try:
-            await app.state.worker_task
-        except asyncio.CancelledError:
-            pass
+        for task in app.state.worker_tasks:
+            task.cancel()
+
+        results = await asyncio.gather(*app.state.worker_tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
+                logger.exception("Worker shutdown error: %s", result)
 
 
 app = FastAPI(
@@ -111,6 +143,13 @@ async def sync_google_sheets(payload: SyncRequest) -> SyncAcceptedResponse:
     )
 
     await app.state.job_queue.put(job_id)
+
+    logger.info(
+        "sync_job_queued job_id=%s queue_size=%s workers=%s",
+        job_id,
+        app.state.job_queue.qsize(),
+        JOB_WORKERS,
+    )
 
     return SyncAcceptedResponse(
         status="accepted",
