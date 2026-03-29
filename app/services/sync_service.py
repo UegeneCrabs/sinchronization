@@ -19,6 +19,7 @@ from app.services.sheets_client import (
 @dataclass
 class SourceInfo:
     data: list[list]
+    rows: list[list]
     header_mapping: dict[str, int]
     header_row_index: int
     barcodes_set: set[str]
@@ -137,6 +138,7 @@ class SyncService:
         if not data:
             return SourceInfo(
                 data=[[]],
+                rows=[],
                 header_mapping={},
                 header_row_index=1,
                 barcodes_set=set(),
@@ -164,7 +166,13 @@ class SyncService:
         is_wb = platform_type == "WB" or "WB" in project_name
         is_ozon = platform_type == "OZON" or "OZON" in project_name or "ОЗОН" in project_name
 
+        supplier_col = source_header_mapping.get("Поставщик")
+        article_col = source_header_mapping.get("Артикул")
+
         barcodes_set: set[str] = set()
+
+        deduped_map: dict[tuple[str, str], list] = {}
+        suppliers_map: dict[tuple[str, str], list[str]] = {}
 
         for row in data[source_header_row_index:]:
             barcode = _cell(row, source_barcode_col).strip()
@@ -187,10 +195,44 @@ class SyncService:
                 if ozon_flag == "Нет на ОЗОН":
                     continue
 
+            article = _cell(row, article_col).strip() if article_col is not None else ""
+            dedupe_key = (barcode, article)
+
+            if dedupe_key not in deduped_map:
+                deduped_map[dedupe_key] = row[:]
+                suppliers_map[dedupe_key] = []
+
+            if supplier_col is not None:
+                supplier_value = _cell(row, supplier_col).strip()
+                if supplier_value and supplier_value not in suppliers_map[dedupe_key]:
+                    suppliers_map[dedupe_key].append(supplier_value)
+
             barcodes_set.add(barcode)
+
+        deduped_rows: list[list] = []
+
+        for dedupe_key, row in deduped_map.items():
+            final_row = row[:]
+
+            if supplier_col is not None:
+                suppliers = suppliers_map.get(dedupe_key, [])
+                if suppliers:
+                    _ensure_width(final_row, supplier_col + 1)
+                    final_row[supplier_col] = "/".join(suppliers)
+
+            deduped_rows.append(final_row)
+
+        self.logger.info(
+            "source_dedupe_profile source_sheet=%s raw_rows=%s deduped_rows=%s unique_barcodes=%s",
+            request.source.sheetName,
+            max(0, len(data) - source_header_row_index),
+            len(deduped_rows),
+            len(barcodes_set),
+        )
 
         return SourceInfo(
             data=data,
+            rows=deduped_rows,
             header_mapping=source_header_mapping,
             header_row_index=source_header_row_index,
             barcodes_set=barcodes_set,
@@ -237,14 +279,10 @@ class SyncService:
         source_juridical_col = source_info.header_mapping[request.filters.columnNames.juridicalColumn]
 
         merge_start = time.perf_counter()
-        for src_row in source_info.data[source_info.header_row_index:]:
+        for src_row in source_info.rows:
             src_bc = _cell(src_row, source_barcode_col).strip()
-            src_status = _cell(src_row, source_status_col).strip()
-            src_juridical = _cell(src_row, source_juridical_col).strip()
 
-            if not src_bc or src_juridical != request.filters.juridicalPerson:
-                continue
-            if src_status in request.filters.excludeStatuses:
+            if not src_bc:
                 continue
 
             new_values: dict[str, str] = {}
@@ -279,7 +317,7 @@ class SyncService:
                 target_barcode_map[src_bc] = row_idx
                 added_products_count += 1
 
-        merge_ms = int((time.perf_counter() - merge_start) * 1000)
+        merge_ms = int((time.perf_counter() - merge_start))
 
         missing_start = time.perf_counter()
         missing_cells = self._find_missing_barcodes(
