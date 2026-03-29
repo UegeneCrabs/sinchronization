@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 
 class SourceConfig(BaseModel):
@@ -17,6 +17,28 @@ class TargetConfig(BaseModel):
     spreadsheetUrl: HttpUrl
     headers: list[str] = Field(default_factory=list)
     mapping: dict[str, str] = Field(default_factory=dict)
+    colorRange: str | None = None
+
+    @field_validator("colorRange")
+    @classmethod
+    def validate_color_range(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+
+        raw = value.strip().upper()
+        if not raw:
+            return None
+
+        parts = raw.split(":")
+        if len(parts) > 2:
+            raise ValueError("colorRange must be a single column or column range, for example 'C' or 'C:G'")
+
+        for part in parts:
+            part = part.strip()
+            if not part or not part.isalpha():
+                raise ValueError("colorRange must contain only A1 column letters, for example 'C:G'")
+
+        return raw
 
 
 class ColumnNames(BaseModel):
