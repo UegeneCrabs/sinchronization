@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
+import logging
 import os
 from pathlib import Path
-from typing import Iterable, Protocol
+import random
+import threading
 import time
-import logging
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
+from typing import Iterable, Literal, Protocol
 
 from app.utils import extract_spreadsheet_id
 
@@ -134,27 +137,120 @@ class InMemorySheetsClient:
         return result
 
 
-class GoogleApiSheetsClient:
-    """Google Sheets API client.
+class RequestRateLimiter:
+    """
+    Общий лимитер на все Google API вызовы внутри процесса.
 
-    Requires a configured Google credential environment (ADC or service account).
+    Работает по sliding window на 60 секунд:
+    - отдельный лимит на read
+    - отдельный лимит на write
+    - общий лимит на одновременные запросы
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        read_per_minute: int,
+        write_per_minute: int,
+        max_inflight: int,
+    ) -> None:
+        self._read_per_minute = read_per_minute
+        self._write_per_minute = write_per_minute
+        self._read_timestamps: deque[float] = deque()
+        self._write_timestamps: deque[float] = deque()
+        self._condition = threading.Condition()
+        self._inflight = threading.BoundedSemaphore(value=max_inflight)
+
+    def acquire(self, request_kind: Literal["read", "write"]) -> None:
+        queue = self._read_timestamps if request_kind == "read" else self._write_timestamps
+        limit = self._read_per_minute if request_kind == "read" else self._write_per_minute
+
+        with self._condition:
+            while True:
+                now = time.monotonic()
+                self._drop_expired(queue, now)
+
+                if len(queue) < limit:
+                    queue.append(now)
+                    return
+
+                oldest = queue[0]
+                wait_seconds = max(0.05, 60.0 - (now - oldest))
+                self._condition.wait(timeout=wait_seconds)
+
+    def release_waiters(self) -> None:
+        with self._condition:
+            self._condition.notify_all()
+
+    def acquire_inflight(self) -> None:
+        self._inflight.acquire()
+
+    def release_inflight(self) -> None:
+        self._inflight.release()
+
+    @staticmethod
+    def _drop_expired(queue: deque[float], now: float) -> None:
+        while queue and (now - queue[0]) >= 60.0:
+            queue.popleft()
+
+
+class GoogleApiSheetsClient:
+    """
+    Google Sheets API client:
+    - отдельный service/http на поток
+    - retry на 429/5xx и квотные 403
+    - truncated exponential backoff + jitter
+    - общий limiter на read/write
+    """
+
+    def __init__(
+        self,
+        *,
+        read_per_minute: int = 45,
+        write_per_minute: int = 45,
+        max_inflight_requests: int = 4,
+        max_retries: int = 6,
+        max_backoff_seconds: int = 32,
+        http_timeout_seconds: int = 120,
+    ) -> None:
         try:
+            import google_auth_httplib2
+            import httplib2
             from google.oauth2 import service_account
             from googleapiclient.discovery import build
+            from googleapiclient.errors import HttpError
         except ModuleNotFoundError as exc:
             raise RuntimeError(
                 "Google client libraries are not installed for this Python interpreter. "
-                "Install with: python -m pip install google-api-python-client google-auth"
+                "Install with: python -m pip install google-api-python-client google-auth google-auth-httplib2"
             ) from exc
+
+        self._service_account = service_account
+        self._build = build
+        self._httplib2 = httplib2
+        self._google_auth_httplib2 = google_auth_httplib2
+        self._http_error_cls = HttpError
 
         creds_file = self._resolve_credentials_file()
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        credentials = service_account.Credentials.from_service_account_file(creds_file, scopes=scopes)
-        self._service = build("sheets", "v4", credentials=credentials)
+        self._credentials = self._service_account.Credentials.from_service_account_file(
+            creds_file,
+            scopes=scopes,
+        )
+
+        self._thread_local = threading.local()
         self._sheet_id_cache: dict[tuple[str, str], int] = {}
+        self._sheet_id_cache_lock = threading.Lock()
+
+        self._rate_limiter = RequestRateLimiter(
+            read_per_minute=read_per_minute,
+            write_per_minute=write_per_minute,
+            max_inflight=max_inflight_requests,
+        )
+
+        self._max_retries = max_retries
+        self._max_backoff_seconds = max_backoff_seconds
+        self._http_timeout_seconds = http_timeout_seconds
         self.logger = logging.getLogger("uvicorn.error")
 
     @staticmethod
@@ -172,6 +268,149 @@ class GoogleApiSheetsClient:
             "or place missilesupply-828b4f393287.json in the project root."
         )
 
+    def _get_service(self):
+        service = getattr(self._thread_local, "service", None)
+        if service is not None:
+            return service
+
+        http = self._httplib2.Http(timeout=self._http_timeout_seconds)
+        authed_http = self._google_auth_httplib2.AuthorizedHttp(self._credentials, http=http)
+        service = self._build(
+            "sheets",
+            "v4",
+            http=authed_http,
+            cache_discovery=False,
+        )
+
+        self._thread_local.service = service
+        return service
+
+    def _execute_with_retry(
+        self,
+        request_factory,
+        *,
+        request_kind: Literal["read", "write"],
+        operation_name: str,
+        sheet_name: str,
+    ):
+        last_error = None
+
+        for attempt in range(self._max_retries + 1):
+            self._rate_limiter.acquire(request_kind)
+            self._rate_limiter.acquire_inflight()
+
+            try:
+                request = request_factory()
+                return request.execute()
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                retriable, reason = self._is_retryable_error(exc)
+
+                if not retriable or attempt >= self._max_retries:
+                    raise
+
+                sleep_seconds = min(
+                    (2 ** attempt) + random.uniform(0, 1),
+                    self._max_backoff_seconds,
+                )
+
+                self.logger.warning(
+                    (
+                        "google_api_retry operation=%s sheet=%s request_kind=%s "
+                        "attempt=%s sleep_s=%.2f reason=%s"
+                    ),
+                    operation_name,
+                    sheet_name,
+                    request_kind,
+                    attempt + 1,
+                    sleep_seconds,
+                    reason,
+                )
+            finally:
+                self._rate_limiter.release_inflight()
+                self._rate_limiter.release_waiters()
+
+            time.sleep(sleep_seconds)
+
+        raise last_error
+
+    def _is_retryable_error(self, exc: Exception) -> tuple[bool, str]:
+        if isinstance(exc, TimeoutError):
+            return True, "timeout"
+
+        if isinstance(exc, self._http_error_cls):
+            status = getattr(exc.resp, "status", None)
+            reason = self._extract_http_error_reason(exc)
+
+            if status in {429, 500, 502, 503, 504}:
+                return True, f"http_{status}:{reason}"
+
+            if status == 403 and reason in {
+                "rateLimitExceeded",
+                "userRateLimitExceeded",
+                "quotaExceeded",
+            }:
+                return True, f"http_403:{reason}"
+
+            return False, f"http_{status}:{reason}"
+
+        message = str(exc).lower()
+        if any(token in message for token in ("timed out", "timeout", "connection reset", "temporarily unavailable")):
+            return True, "network_transient"
+
+        return False, exc.__class__.__name__
+
+    @staticmethod
+    def _extract_http_error_reason(exc: Exception) -> str:
+        content = getattr(exc, "content", b"")
+        if not content:
+            return "unknown"
+
+        try:
+            payload = json.loads(content.decode("utf-8"))
+        except Exception:
+            return "unknown"
+
+        error = payload.get("error", {})
+        errors = error.get("errors", [])
+        if errors and isinstance(errors, list):
+            first = errors[0]
+            if isinstance(first, dict):
+                return str(first.get("reason") or first.get("message") or "unknown")
+
+        return str(error.get("message") or "unknown")
+
+    def _get_sheet_id(self, spreadsheet_id: str, sheet_name: str) -> int:
+        cache_key = (spreadsheet_id, sheet_name)
+
+        with self._sheet_id_cache_lock:
+            cached = self._sheet_id_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+        sheet_id = self._resolve_sheet_id_remote(spreadsheet_id, sheet_name)
+
+        with self._sheet_id_cache_lock:
+            self._sheet_id_cache[cache_key] = sheet_id
+
+        return sheet_id
+
+    def _resolve_sheet_id_remote(self, spreadsheet_id: str, sheet_name: str) -> int:
+        service = self._get_service()
+        meta = self._execute_with_retry(
+            lambda: service.spreadsheets().get(spreadsheetId=spreadsheet_id),
+            request_kind="read",
+            operation_name="resolve_sheet_id",
+            sheet_name=sheet_name,
+        )
+
+        for sheet in meta.get("sheets", []):
+            props = sheet.get("properties", {})
+            if props.get("title") == sheet_name:
+                return int(props["sheetId"])
+
+        raise ValueError(f"Sheet not found: {sheet_name}")
+
     def read_sheet(self, spreadsheet_url: str, sheet_name: str) -> list[list]:
         started = time.perf_counter()
 
@@ -179,11 +418,16 @@ class GoogleApiSheetsClient:
         if not spreadsheet_id:
             raise ValueError("Invalid spreadsheet URL")
 
-        result = (
-            self._service.spreadsheets()
-            .values()
-            .get(spreadsheetId=spreadsheet_id, range=sheet_name)
-            .execute()
+        service = self._get_service()
+        result = self._execute_with_retry(
+            lambda: (
+                service.spreadsheets()
+                .values()
+                .get(spreadsheetId=spreadsheet_id, range=sheet_name)
+            ),
+            request_kind="read",
+            operation_name="read_sheet",
+            sheet_name=sheet_name,
         )
         values = result.get("values", [])
 
@@ -210,15 +454,9 @@ class GoogleApiSheetsClient:
         if not cells:
             return {}
 
-        cache_key = (spreadsheet_id, sheet_name)
-        sheet_id = self._sheet_id_cache.get(cache_key)
-
-        resolve_sheet_id_ms = 0
-        if sheet_id is None:
-            resolve_start = time.perf_counter()
-            sheet_id = _resolve_sheet_id(self._service, spreadsheet_id, sheet_name)
-            self._sheet_id_cache[cache_key] = sheet_id
-            resolve_sheet_id_ms = int((time.perf_counter() - resolve_start) * 1000)
+        resolve_start = time.perf_counter()
+        sheet_id = self._get_sheet_id(spreadsheet_id, sheet_name)
+        resolve_sheet_id_ms = int((time.perf_counter() - resolve_start) * 1000)
 
         cells_by_row: dict[int, list[int]] = defaultdict(list)
         for row_idx, col_idx in cells:
@@ -237,21 +475,26 @@ class GoogleApiSheetsClient:
                     }
                 )
 
+        service = self._get_service()
         grid_start = time.perf_counter()
-        response = (
-            self._service.spreadsheets()
-            .get(
-                spreadsheetId=spreadsheet_id,
-                ranges=[_grid_range_to_a1(sheet_name, grid_range) for grid_range in ranges],
-                includeGridData=True,
-                fields=(
-                    "sheets(data(startRow,startColumn,rowData(values("
-                    "effectiveFormat(backgroundColor,backgroundColorStyle),"
-                    "userEnteredFormat(backgroundColor,backgroundColorStyle)"
-                    "))))"
-                ),
-            )
-            .execute()
+        response = self._execute_with_retry(
+            lambda: (
+                service.spreadsheets()
+                .get(
+                    spreadsheetId=spreadsheet_id,
+                    ranges=[_grid_range_to_a1(sheet_name, grid_range) for grid_range in ranges],
+                    includeGridData=True,
+                    fields=(
+                        "sheets(data(startRow,startColumn,rowData(values("
+                        "effectiveFormat(backgroundColor,backgroundColorStyle),"
+                        "userEnteredFormat(backgroundColor,backgroundColorStyle)"
+                        "))))"
+                    ),
+                )
+            ),
+            request_kind="read",
+            operation_name="read_background_colors",
+            sheet_name=sheet_name,
         )
         grid_read_ms = int((time.perf_counter() - grid_start) * 1000)
 
@@ -315,15 +558,9 @@ class GoogleApiSheetsClient:
         if start_col < 0 or end_col < start_col:
             return {}
 
-        cache_key = (spreadsheet_id, sheet_name)
-        sheet_id = self._sheet_id_cache.get(cache_key)
-
-        resolve_sheet_id_ms = 0
-        if sheet_id is None:
-            resolve_start = time.perf_counter()
-            sheet_id = _resolve_sheet_id(self._service, spreadsheet_id, sheet_name)
-            self._sheet_id_cache[cache_key] = sheet_id
-            resolve_sheet_id_ms = int((time.perf_counter() - resolve_start) * 1000)
+        resolve_start = time.perf_counter()
+        sheet_id = self._get_sheet_id(spreadsheet_id, sheet_name)
+        resolve_sheet_id_ms = int((time.perf_counter() - resolve_start) * 1000)
 
         row_groups = _group_indexes_to_ranges(list(row_indexes))
 
@@ -339,21 +576,26 @@ class GoogleApiSheetsClient:
                 }
             )
 
+        service = self._get_service()
         grid_start = time.perf_counter()
-        response = (
-            self._service.spreadsheets()
-            .get(
-                spreadsheetId=spreadsheet_id,
-                ranges=[_grid_range_to_a1(sheet_name, grid_range) for grid_range in ranges],
-                includeGridData=True,
-                fields=(
-                    "sheets(data(startRow,startColumn,rowData(values("
-                    "effectiveFormat(backgroundColor,backgroundColorStyle),"
-                    "userEnteredFormat(backgroundColor,backgroundColorStyle)"
-                    "))))"
-                ),
-            )
-            .execute()
+        response = self._execute_with_retry(
+            lambda: (
+                service.spreadsheets()
+                .get(
+                    spreadsheetId=spreadsheet_id,
+                    ranges=[_grid_range_to_a1(sheet_name, grid_range) for grid_range in ranges],
+                    includeGridData=True,
+                    fields=(
+                        "sheets(data(startRow,startColumn,rowData(values("
+                        "effectiveFormat(backgroundColor,backgroundColorStyle),"
+                        "userEnteredFormat(backgroundColor,backgroundColorStyle)"
+                        "))))"
+                    ),
+                )
+            ),
+            request_kind="read",
+            operation_name="read_background_colors_in_range",
+            sheet_name=sheet_name,
         )
         grid_read_ms = int((time.perf_counter() - grid_start) * 1000)
 
@@ -410,6 +652,8 @@ class GoogleApiSheetsClient:
         if not spreadsheet_id:
             raise ValueError("Invalid spreadsheet URL")
 
+        service = self._get_service()
+
         value_write_ms = 0
         resolve_sheet_id_ms = 0
         background_group_ms = 0
@@ -429,74 +673,73 @@ class GoogleApiSheetsClient:
                     }
                     for item in chunk
                 ]
-                (
-                    self._service.spreadsheets()
-                    .values()
-                    .batchUpdate(
-                        spreadsheetId=spreadsheet_id,
-                        body={
-                            "valueInputOption": "RAW",
-                            "data": data,
-                        },
-                    )
-                    .execute()
+                self._execute_with_retry(
+                    lambda chunk_data=data: (
+                        service.spreadsheets()
+                        .values()
+                        .batchUpdate(
+                            spreadsheetId=spreadsheet_id,
+                            body={
+                                "valueInputOption": "RAW",
+                                "data": chunk_data,
+                            },
+                        )
+                    ),
+                    request_kind="write",
+                    operation_name="write_values_batch",
+                    sheet_name=sheet_name,
                 )
             value_write_ms = int((time.perf_counter() - started) * 1000)
 
         if payload.background_updates:
-            cache_key = (spreadsheet_id, sheet_name)
-            sheet_id = self._sheet_id_cache.get(cache_key)
-
-            if sheet_id is None:
-                started = time.perf_counter()
-                sheet_id = _resolve_sheet_id(self._service, spreadsheet_id, sheet_name)
-                self._sheet_id_cache[cache_key] = sheet_id
-                resolve_sheet_id_ms = int((time.perf_counter() - started) * 1000)
+            resolve_start = time.perf_counter()
+            sheet_id = self._get_sheet_id(spreadsheet_id, sheet_name)
+            resolve_sheet_id_ms = int((time.perf_counter() - resolve_start) * 1000)
 
             started = time.perf_counter()
             grouped_updates = _group_cell_style_updates(payload.background_updates)
             grouped_background_count = len(grouped_updates)
             background_group_ms = int((time.perf_counter() - started) * 1000)
 
-            try:
-                started = time.perf_counter()
-                for chunk in _chunked(grouped_updates, FORMAT_BATCH_SIZE):
-                    requests = []
-                    for update in chunk:
-                        rgb = _to_rgb(update.color)
-                        requests.append(
-                            {
-                                "repeatCell": {
-                                    "range": {
-                                        "sheetId": sheet_id,
-                                        "startRowIndex": update.start_row,
-                                        "endRowIndex": update.end_row,
-                                        "startColumnIndex": update.start_col,
-                                        "endColumnIndex": update.end_col,
-                                    },
-                                    "cell": {
-                                        "userEnteredFormat": {
-                                            "backgroundColor": rgb,
-                                        }
-                                    },
-                                    "fields": "userEnteredFormat.backgroundColor",
-                                }
+            started = time.perf_counter()
+            for chunk in _chunked(grouped_updates, FORMAT_BATCH_SIZE):
+                requests = []
+                for update in chunk:
+                    rgb = _to_rgb(update.color)
+                    requests.append(
+                        {
+                            "repeatCell": {
+                                "range": {
+                                    "sheetId": sheet_id,
+                                    "startRowIndex": update.start_row,
+                                    "endRowIndex": update.end_row,
+                                    "startColumnIndex": update.start_col,
+                                    "endColumnIndex": update.end_col,
+                                },
+                                "cell": {
+                                    "userEnteredFormat": {
+                                        "backgroundColor": rgb,
+                                    }
+                                },
+                                "fields": "userEnteredFormat.backgroundColor",
                             }
-                        )
-
-                    (
-                        self._service.spreadsheets()
-                        .batchUpdate(
-                            spreadsheetId=spreadsheet_id,
-                            body={"requests": requests},
-                        )
-                        .execute()
+                        }
                     )
 
-                background_write_ms = int((time.perf_counter() - started) * 1000)
-            except Exception:
-                self.logger.exception("background_update_failed sheet=%s", sheet_name)
-                return
+                self._execute_with_retry(
+                    lambda body_requests=requests: (
+                        service.spreadsheets()
+                        .batchUpdate(
+                            spreadsheetId=spreadsheet_id,
+                            body={"requests": body_requests},
+                        )
+                    ),
+                    request_kind="write",
+                    operation_name="write_background_batch",
+                    sheet_name=sheet_name,
+                )
+
+            background_write_ms = int((time.perf_counter() - started) * 1000)
 
         total_ms = int((time.perf_counter() - total_start) * 1000)
         self.logger.info(
@@ -526,17 +769,6 @@ class GoogleApiSheetsClient:
             background_write_ms,
             total_ms,
         )
-
-
-def _resolve_sheet_id(service, spreadsheet_id: str, sheet_name: str) -> int:
-    meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-
-    for sheet in meta.get("sheets", []):
-        props = sheet.get("properties", {})
-        if props.get("title") == sheet_name:
-            return int(props["sheetId"])
-
-    raise ValueError(f"Sheet not found: {sheet_name}")
 
 
 def _extract_data_blocks(response: dict) -> list[dict]:

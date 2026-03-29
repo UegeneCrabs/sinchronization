@@ -3,3 +3,4 @@ uvicorn
 pydantic
 google-api-python-client
 pytest
+google-auth-httplib2
