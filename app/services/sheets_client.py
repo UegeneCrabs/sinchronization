@@ -647,6 +647,7 @@ class GoogleApiSheetsClient:
 
     def write_sheet(self, spreadsheet_url: str, sheet_name: str, payload: SheetWritePayload) -> None:
         total_start = time.perf_counter()
+        debug_barcode = os.getenv("DEBUG_BARCODE", "").strip()
 
         spreadsheet_id = extract_spreadsheet_id(spreadsheet_url)
         if not spreadsheet_id:
@@ -665,14 +666,62 @@ class GoogleApiSheetsClient:
 
         if payload.value_updates:
             started = time.perf_counter()
-            for chunk in _chunked(payload.value_updates, VALUE_BATCH_SIZE):
-                data = [
-                    {
-                        "range": f"{sheet_name}!{_a1(item.col, item.row)}",
-                        "values": [[item.value]],
-                    }
-                    for item in chunk
-                ]
+
+            sanitized_value_updates = []
+            debug_written_cells: list[tuple[int, int, object]] = []
+
+            for item in payload.value_updates:
+                sanitized_value = _sanitize_outgoing_sheet_value(item.value)
+
+                if debug_barcode:
+                    raw_norm = _normalized_identifier_for_debug(item.value)
+                    sanitized_norm = _normalized_identifier_for_debug(sanitized_value)
+                    if raw_norm == debug_barcode or sanitized_norm == debug_barcode:
+                        self.logger.info(
+                            "debug_write_sanitize sheet=%s row=%s col=%s raw_value=%r raw_type=%s sanitized_value=%r sanitized_type=%s raw_norm=%r sanitized_norm=%r",
+                            sheet_name,
+                            item.row,
+                            item.col,
+                            item.value,
+                            type(item.value).__name__,
+                            sanitized_value,
+                            type(sanitized_value).__name__,
+                            raw_norm,
+                            sanitized_norm,
+                        )
+                        debug_written_cells.append((item.row, item.col, sanitized_value))
+
+                sanitized_value_updates.append(
+                    CellValueUpdate(
+                        row=item.row,
+                        col=item.col,
+                        value=sanitized_value,
+                    )
+                )
+
+            for chunk in _chunked(sanitized_value_updates, VALUE_BATCH_SIZE):
+                data = []
+                for item in chunk:
+                    if debug_barcode:
+                        normalized = _normalized_identifier_for_debug(item.value)
+                        if normalized == debug_barcode:
+                            self.logger.info(
+                                "debug_write_payload sheet=%s row=%s col=%s final_value=%r final_type=%s a1=%s",
+                                sheet_name,
+                                item.row,
+                                item.col,
+                                item.value,
+                                type(item.value).__name__,
+                                _a1(item.col, item.row),
+                            )
+
+                    data.append(
+                        {
+                            "range": f"{sheet_name}!{_a1(item.col, item.row)}",
+                            "values": [[item.value]],
+                        }
+                    )
+
                 self._execute_with_retry(
                     lambda chunk_data=data: (
                         service.spreadsheets()
@@ -689,6 +738,41 @@ class GoogleApiSheetsClient:
                     operation_name="write_values_batch",
                     sheet_name=sheet_name,
                 )
+
+            if debug_written_cells:
+                for row_idx, col_idx, expected_value in debug_written_cells:
+                    a1 = _a1(col_idx, row_idx)
+
+                    read_back = self._execute_with_retry(
+                        lambda read_range=f"{sheet_name}!{a1}": (
+                            service.spreadsheets()
+                            .values()
+                            .get(
+                                spreadsheetId=spreadsheet_id,
+                                range=read_range,
+                                valueRenderOption="UNFORMATTED_VALUE",
+                            )
+                        ),
+                        request_kind="read",
+                        operation_name="debug_read_after_write",
+                        sheet_name=sheet_name,
+                    )
+
+                    read_back_values = read_back.get("values", [])
+                    read_back_value = ""
+                    if read_back_values and read_back_values[0]:
+                        read_back_value = read_back_values[0][0]
+
+                    self.logger.info(
+                        "debug_read_after_write sheet=%s a1=%s expected_value=%r expected_type=%s read_back_value=%r read_back_type=%s",
+                        sheet_name,
+                        a1,
+                        expected_value,
+                        type(expected_value).__name__,
+                        read_back_value,
+                        type(read_back_value).__name__,
+                    )
+
             value_write_ms = int((time.perf_counter() - started) * 1000)
 
         if payload.background_updates:
@@ -728,8 +812,7 @@ class GoogleApiSheetsClient:
 
                 self._execute_with_retry(
                     lambda body_requests=requests: (
-                        service.spreadsheets()
-                        .batchUpdate(
+                        service.spreadsheets().batchUpdate(
                             spreadsheetId=spreadsheet_id,
                             body={"requests": body_requests},
                         )
@@ -742,18 +825,13 @@ class GoogleApiSheetsClient:
             background_write_ms = int((time.perf_counter() - started) * 1000)
 
         total_ms = int((time.perf_counter() - total_start) * 1000)
+
         self.logger.info(
             (
                 "write_profile sheet=%s "
-                "value_updates=%s "
-                "background_updates_in=%s "
-                "background_updates_grouped=%s "
+                "value_updates=%s background_updates_in=%s background_updates_grouped=%s "
                 "white=%s orange=%s red=%s lightblue=%s "
-                "value_write_ms=%s "
-                "resolve_sheet_id_ms=%s "
-                "background_group_ms=%s "
-                "background_write_ms=%s "
-                "total_ms=%s"
+                "value_write_ms=%s resolve_sheet_id_ms=%s background_group_ms=%s background_write_ms=%s total_ms=%s"
             ),
             sheet_name,
             len(payload.value_updates),
@@ -948,3 +1026,31 @@ def _group_cell_style_updates(updates: list[CellStyleUpdate]) -> list[RangeStyle
 
     ranges.sort(key=lambda x: (x.start_row, x.start_col, x.color))
     return ranges
+
+
+
+def _sanitize_outgoing_sheet_value(value):
+    if value is None:
+        return ""
+
+    if isinstance(value, (int, float)):
+        return value
+
+    result = str(value).replace("\u200b", "").replace("\ufeff", "").strip()
+
+    while result.startswith(("'", "’", "`")):
+        result = result[1:].lstrip()
+
+    return result
+
+
+def _normalized_identifier_for_debug(value) -> str:
+    if value is None:
+        return ""
+
+    result = str(value).replace("\u200b", "").replace("\ufeff", "").strip()
+
+    while result.startswith(("'", "’", "`")):
+        result = result[1:].lstrip()
+
+    return result
