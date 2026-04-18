@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import logging
 import time
 import uuid
@@ -144,6 +145,8 @@ class SyncService:
                 barcodes_set=set(),
             )
 
+        debug_barcode = os.getenv("DEBUG_BARCODE", "").strip()
+
         required_headers = list(request.source.headers)
         columns = request.filters.columnNames
 
@@ -174,10 +177,27 @@ class SyncService:
         deduped_map: dict[tuple[str, str], list] = {}
         suppliers_map: dict[tuple[str, str], list[str]] = {}
 
-        for row in data[source_header_row_index:]:
-            barcode = _cell(row, source_barcode_col).strip()
-            status = _cell(row, source_status_col).strip()
-            juridical = _cell(row, source_juridical_col).strip()
+        for row_idx, row in enumerate(data[source_header_row_index:], start=source_header_row_index):
+            raw_barcode = _cell(row, source_barcode_col)
+            barcode = _normalized_identifier(raw_barcode)
+            status = _normalized_plain(_cell(row, source_status_col))
+            juridical = _normalized_plain(_cell(row, source_juridical_col))
+
+            raw_article = _cell(row, article_col) if article_col is not None else ""
+            article = _normalized_identifier(raw_article) if article_col is not None else ""
+
+            if debug_barcode and (barcode == debug_barcode or raw_barcode.strip().lstrip("'") == debug_barcode):
+                self.logger.info(
+                    "debug_source_row sheet=%s row=%s raw_barcode=%r normalized_barcode=%r raw_article=%r normalized_article=%r status=%r juridical=%r",
+                    request.source.sheetName,
+                    row_idx,
+                    raw_barcode,
+                    barcode,
+                    raw_article,
+                    article,
+                    status,
+                    juridical,
+                )
 
             if not barcode or juridical != request.filters.juridicalPerson:
                 continue
@@ -186,26 +206,70 @@ class SyncService:
                 continue
 
             if is_wb:
-                wb_activity = _cell(row, wb_activity_col).strip()
+                wb_activity = _normalized_plain(_cell(row, wb_activity_col))
+                if debug_barcode and barcode == debug_barcode:
+                    self.logger.info(
+                        "debug_source_wb_filter row=%s wb_activity=%r",
+                        row_idx,
+                        wb_activity,
+                    )
                 if wb_activity == "Старьё":
                     continue
 
             if is_ozon:
-                ozon_flag = _cell(row, ozon_flag_col).strip()
+                ozon_flag = _normalized_plain(_cell(row, ozon_flag_col))
+                if debug_barcode and barcode == debug_barcode:
+                    self.logger.info(
+                        "debug_source_ozon_filter row=%s ozon_flag=%r",
+                        row_idx,
+                        ozon_flag,
+                    )
                 if ozon_flag == "Нет на ОЗОН":
                     continue
 
-            article = _cell(row, article_col).strip() if article_col is not None else ""
             dedupe_key = (barcode, article)
 
+            if debug_barcode and barcode == debug_barcode:
+                self.logger.info(
+                    "debug_source_passed_filters row=%s dedupe_key=%r supplier_raw=%r",
+                    row_idx,
+                    dedupe_key,
+                    _cell(row, supplier_col) if supplier_col is not None else "",
+                )
+
             if dedupe_key not in deduped_map:
-                deduped_map[dedupe_key] = row[:]
+                clean_row = row[:]
+
+                _ensure_width(clean_row, source_barcode_col + 1)
+                clean_row[source_barcode_col] = barcode
+
+                if article_col is not None:
+                    _ensure_width(clean_row, article_col + 1)
+                    clean_row[article_col] = article
+
+                deduped_map[dedupe_key] = clean_row
                 suppliers_map[dedupe_key] = []
 
+                if debug_barcode and barcode == debug_barcode:
+                    self.logger.info(
+                        "debug_source_dedup_create row=%s stored_barcode=%r stored_article=%r",
+                        row_idx,
+                        clean_row[source_barcode_col],
+                        clean_row[article_col] if article_col is not None else "",
+                    )
+
             if supplier_col is not None:
-                supplier_value = _cell(row, supplier_col).strip()
+                supplier_value = _normalized_plain(_cell(row, supplier_col))
                 if supplier_value and supplier_value not in suppliers_map[dedupe_key]:
                     suppliers_map[dedupe_key].append(supplier_value)
+
+                    if debug_barcode and barcode == debug_barcode:
+                        self.logger.info(
+                            "debug_source_supplier_append row=%s supplier=%r suppliers_now=%r",
+                            row_idx,
+                            supplier_value,
+                            suppliers_map[dedupe_key],
+                        )
 
             barcodes_set.add(barcode)
 
@@ -213,6 +277,7 @@ class SyncService:
 
         for dedupe_key, row in deduped_map.items():
             final_row = row[:]
+            barcode, article = dedupe_key
 
             if supplier_col is not None:
                 suppliers = suppliers_map.get(dedupe_key, [])
@@ -221,6 +286,16 @@ class SyncService:
                     final_row[supplier_col] = "/".join(suppliers)
 
             deduped_rows.append(final_row)
+
+            if debug_barcode and barcode == debug_barcode:
+                self.logger.info(
+                    "debug_source_final_dedup barcode=%r article=%r final_barcode_cell=%r final_article_cell=%r final_supplier=%r",
+                    barcode,
+                    article,
+                    final_row[source_barcode_col],
+                    final_row[article_col] if article_col is not None else "",
+                    final_row[supplier_col] if supplier_col is not None and supplier_col < len(final_row) else "",
+                )
 
         self.logger.info(
             "source_dedupe_profile source_sheet=%s raw_rows=%s deduped_rows=%s unique_barcodes=%s",
@@ -239,12 +314,13 @@ class SyncService:
         )
 
     def _process_target(
-        self,
-        request: SyncRequest,
-        target: TargetConfig,
-        source_info: SourceInfo,
+            self,
+            request: SyncRequest,
+            target: TargetConfig,
+            source_info: SourceInfo,
     ) -> SheetSyncResult:
         total_start = time.perf_counter()
+        debug_barcode = os.getenv("DEBUG_BARCODE", "").strip()
 
         read_start = time.perf_counter()
         target_data = self.sheets_client.read_sheet(str(target.spreadsheetUrl), target.sheetName)
@@ -260,47 +336,201 @@ class SyncService:
         barcode_header = request.filters.columnNames.barcodeColumn
         barcode_col_target = target_header_mapping[barcode_header]
 
+        source_barcode_col = source_info.header_mapping[request.filters.columnNames.barcodeColumn]
+
+        source_article_col = None
+        for article_header in ("ARTICLE", "Артикул", "Артикул продавца"):
+            if article_header in source_info.header_mapping:
+                source_article_col = source_info.header_mapping[article_header]
+                break
+
+        target_article_col = None
+        for article_header in ("ARTICLE", "Артикул", "Артикул продавца"):
+            if article_header in target_header_mapping:
+                target_article_col = target_header_mapping[article_header]
+                break
+
+        if target_article_col is None:
+            for target_field, source_field in target.mapping.items():
+                if source_field in {"ARTICLE", "Артикул", "Артикул продавца"} and target_field in target_header_mapping:
+                    target_article_col = target_header_mapping[target_field]
+                    break
+
+        identifier_target_cols: set[int] = {barcode_col_target}
+        numeric_identifier_target_cols: set[int] = {barcode_col_target}
+
+        if target_article_col is not None:
+            identifier_target_cols.add(target_article_col)
+            numeric_identifier_target_cols.add(target_article_col)
+
         barcode_map_start = time.perf_counter()
         target_barcode_map: dict[str, int] = {}
         for i in range(target_header_row_index, len(target_data)):
-            bc = _cell(target_data[i], barcode_col_target).strip()
+            raw_bc = _cell(target_data[i], barcode_col_target)
+            bc = _normalized_identifier(raw_bc)
             if bc:
                 target_barcode_map[bc] = i
+
+            if debug_barcode and (bc == debug_barcode or raw_bc.strip().lstrip("'") == debug_barcode):
+                self.logger.info(
+                    "debug_target_existing_row sheet=%s row=%s raw_barcode=%r normalized_barcode=%r raw_article=%r normalized_article=%r target_article_col=%r",
+                    target.sheetName,
+                    i,
+                    raw_bc,
+                    bc,
+                    _cell(target_data[i], target_article_col) if target_article_col is not None else "",
+                    _normalized_identifier(
+                        _cell(target_data[i], target_article_col)) if target_article_col is not None else "",
+                    target_article_col,
+                )
         barcode_map_ms = int((time.perf_counter() - barcode_map_start) * 1000)
 
         working_copy_start = time.perf_counter()
         working_data = [row[:] for row in target_data]
         orange_cells: set[tuple[int, int]] = set()
+        force_numeric_identifier_cells: set[tuple[int, int]] = set()
         added_products_count = 0
         working_copy_ms = int((time.perf_counter() - working_copy_start) * 1000)
 
-        source_barcode_col = source_info.header_mapping[request.filters.columnNames.barcodeColumn]
-        source_status_col = source_info.header_mapping[request.filters.columnNames.statusColumn]
-        source_juridical_col = source_info.header_mapping[request.filters.columnNames.juridicalColumn]
-
         merge_start = time.perf_counter()
         for src_row in source_info.rows:
-            src_bc = _cell(src_row, source_barcode_col).strip()
-
+            src_bc = _normalized_identifier(_cell(src_row, source_barcode_col))
             if not src_bc:
                 continue
 
-            new_values: dict[str, str] = {}
+            src_article = _normalized_identifier(
+                _cell(src_row, source_article_col)) if source_article_col is not None else ""
+
+            if debug_barcode and src_bc == debug_barcode:
+                self.logger.info(
+                    "debug_merge_source_hit sheet=%s src_barcode=%r src_article=%r target_row_exists=%s target_row_idx=%r source_article_col=%r target_article_col=%r",
+                    target.sheetName,
+                    src_bc,
+                    src_article,
+                    src_bc in target_barcode_map,
+                    target_barcode_map.get(src_bc),
+                    source_article_col,
+                    target_article_col,
+                )
+
+            new_values_by_col: dict[int, str] = {}
+
             for target_field, source_field in target.mapping.items():
-                if source_field in source_info.header_mapping:
-                    source_col = source_info.header_mapping[source_field]
-                    new_values[target_field] = _cell(src_row, source_col)
+                if source_field not in source_info.header_mapping:
+                    continue
+                if target_field not in target_header_mapping:
+                    continue
+
+                source_col = source_info.header_mapping[source_field]
+                target_col = target_header_mapping[target_field]
+                raw_value = _cell(src_row, source_col)
+
+                if source_col == source_barcode_col or (
+                        source_article_col is not None and source_col == source_article_col
+                ):
+                    value = _normalized_identifier(raw_value)
+                else:
+                    value = _normalized_plain(raw_value)
+
+                new_values_by_col[target_col] = value
+
+                if debug_barcode and src_bc == debug_barcode:
+                    self.logger.info(
+                        "debug_merge_mapping sheet=%s src_barcode=%r target_field=%r source_field=%r raw_value=%r normalized_value=%r target_col=%s",
+                        target.sheetName,
+                        src_bc,
+                        target_field,
+                        source_field,
+                        raw_value,
+                        value,
+                        target_col,
+                    )
+
+            new_values_by_col[barcode_col_target] = src_bc
+
+            if source_article_col is not None and target_article_col is not None:
+                new_values_by_col[target_article_col] = src_article
+
+            if debug_barcode and src_bc == debug_barcode:
+                self.logger.info(
+                    "debug_merge_new_values sheet=%s src_barcode=%r barcode_target_col=%s article_target_col=%r new_values_by_col=%r",
+                    target.sheetName,
+                    src_bc,
+                    barcode_col_target,
+                    target_article_col,
+                    new_values_by_col,
+                )
 
             if src_bc in target_barcode_map:
                 row_idx = target_barcode_map[src_bc]
                 _ensure_width(working_data[row_idx], _max_col(target_header_mapping) + 1)
 
-                for key, new_value in new_values.items():
-                    col_idx = target_header_mapping[key]
-                    old_value = _cell(working_data[row_idx], col_idx).strip()
-                    if old_value != new_value.strip():
-                        working_data[row_idx][col_idx] = new_value
-                        orange_cells.add((row_idx, col_idx))
+                if debug_barcode and src_bc == debug_barcode:
+                    self.logger.info(
+                        "debug_merge_existing_before sheet=%s row=%s barcode_raw=%r barcode_norm=%r article_raw=%r article_norm=%r",
+                        target.sheetName,
+                        row_idx,
+                        _cell(working_data[row_idx], barcode_col_target),
+                        _normalized_identifier(_cell(working_data[row_idx], barcode_col_target)),
+                        _cell(working_data[row_idx], target_article_col) if target_article_col is not None else "",
+                        _normalized_identifier(
+                            _cell(working_data[row_idx], target_article_col)) if target_article_col is not None else "",
+                    )
+
+                for col_idx, new_value in new_values_by_col.items():
+                    old_raw = _cell(working_data[row_idx], col_idx)
+
+                    if col_idx in identifier_target_cols:
+                        old_value_normalized = _normalized_identifier(old_raw)
+                        should_update = old_raw != new_value or old_value_normalized != new_value
+
+                        if debug_barcode and src_bc == debug_barcode:
+                            self.logger.info(
+                                "debug_merge_compare_identifier sheet=%s row=%s col=%s old_raw=%r old_normalized=%r new_value=%r should_update=%s",
+                                target.sheetName,
+                                row_idx,
+                                col_idx,
+                                old_raw,
+                                old_value_normalized,
+                                new_value,
+                                should_update,
+                            )
+
+                        if should_update:
+                            working_data[row_idx][col_idx] = new_value
+                            orange_cells.add((row_idx, col_idx))
+
+                        if col_idx in numeric_identifier_target_cols:
+                            force_numeric_identifier_cells.add((row_idx, col_idx))
+
+                            if debug_barcode and src_bc == debug_barcode:
+                                self.logger.info(
+                                    "debug_force_numeric_identifier sheet=%s row=%s col=%s old_raw=%r new_value=%r",
+                                    target.sheetName,
+                                    row_idx,
+                                    col_idx,
+                                    old_raw,
+                                    new_value,
+                                )
+                    else:
+                        old_value = _normalized_plain(old_raw)
+                        should_update = old_value != new_value
+
+                        if debug_barcode and src_bc == debug_barcode:
+                            self.logger.info(
+                                "debug_merge_compare_plain sheet=%s row=%s col=%s old_raw=%r old_normalized=%r new_value=%r should_update=%s",
+                                target.sheetName,
+                                row_idx,
+                                col_idx,
+                                old_raw,
+                                old_value,
+                                new_value,
+                                should_update,
+                            )
+
+                        if should_update:
+                            working_data[row_idx][col_idx] = new_value
+                            orange_cells.add((row_idx, col_idx))
             else:
                 row_idx = self._find_or_append_empty_row(
                     working_data,
@@ -309,15 +539,35 @@ class SyncService:
                 )
                 _ensure_width(working_data[row_idx], _max_col(target_header_mapping) + 1)
 
-                for key, new_value in new_values.items():
-                    col_idx = target_header_mapping[key]
+                if debug_barcode and src_bc == debug_barcode:
+                    self.logger.info(
+                        "debug_merge_append_row sheet=%s row=%s before_barcode=%r before_article=%r",
+                        target.sheetName,
+                        row_idx,
+                        _cell(working_data[row_idx], barcode_col_target),
+                        _cell(working_data[row_idx], target_article_col) if target_article_col is not None else "",
+                    )
+
+                for col_idx, new_value in new_values_by_col.items():
                     working_data[row_idx][col_idx] = new_value
                     orange_cells.add((row_idx, col_idx))
+
+                    if col_idx in numeric_identifier_target_cols:
+                        force_numeric_identifier_cells.add((row_idx, col_idx))
+
+                    if debug_barcode and src_bc == debug_barcode:
+                        self.logger.info(
+                            "debug_merge_append_value sheet=%s row=%s col=%s stored_value=%r",
+                            target.sheetName,
+                            row_idx,
+                            col_idx,
+                            working_data[row_idx][col_idx],
+                        )
 
                 target_barcode_map[src_bc] = row_idx
                 added_products_count += 1
 
-        merge_ms = int((time.perf_counter() - merge_start))
+        merge_ms = int((time.perf_counter() - merge_start) * 1000)
 
         missing_start = time.perf_counter()
         missing_cells = self._find_missing_barcodes(
@@ -340,10 +590,34 @@ class SyncService:
 
         payload_prepare_start = time.perf_counter()
 
-        value_updates = [
-            CellValueUpdate(row=row, col=col, value=_cell(working_data[row], col))
-            for row, col in sorted(orange_cells)
-        ]
+        cells_to_write = sorted(orange_cells | force_numeric_identifier_cells)
+
+        value_updates = []
+        for row, col in cells_to_write:
+            raw_value = _cell(working_data[row], col)
+
+            if col in numeric_identifier_target_cols:
+                final_value = _to_sheet_number_if_possible(raw_value)
+            else:
+                final_value = raw_value
+
+            value_updates.append(CellValueUpdate(row=row, col=col, value=final_value))
+
+            if debug_barcode and col in numeric_identifier_target_cols:
+                normalized = _normalized_identifier(raw_value)
+                if normalized == debug_barcode or (
+                        target_article_col is not None and col == target_article_col
+                ):
+                    self.logger.info(
+                        "debug_value_update_pre_write sheet=%s row=%s col=%s raw_value=%r final_value=%r final_type=%s normalized=%r",
+                        target.sheetName,
+                        row,
+                        col,
+                        raw_value,
+                        final_value,
+                        type(final_value).__name__,
+                        normalized,
+                    )
 
         style_result = self._build_style_updates(
             include_coloring=request.options.includeColoring,
@@ -444,11 +718,11 @@ class SyncService:
 
     @staticmethod
     def _find_missing_barcodes(
-        data: list[list],
-        header_mapping: dict[str, int],
-        barcode_header: str,
-        source_barcodes: set[str],
-        header_row_index: int,
+            data: list[list],
+            header_mapping: dict[str, int],
+            barcode_header: str,
+            source_barcodes: set[str],
+            header_row_index: int,
     ) -> set[tuple[int, int]]:
         barcode_col = header_mapping.get(barcode_header)
         if barcode_col is None:
@@ -456,17 +730,17 @@ class SyncService:
 
         missing: set[tuple[int, int]] = set()
         for i in range(header_row_index, len(data)):
-            value = _cell(data[i], barcode_col).strip()
+            value = _normalized_identifier(_cell(data[i], barcode_col))
             if value and value not in source_barcodes:
                 missing.add((i, barcode_col))
         return missing
 
     @staticmethod
     def _find_duplicate_barcodes(
-        data: list[list],
-        header_mapping: dict[str, int],
-        barcode_header: str,
-        header_row_index: int,
+            data: list[list],
+            header_mapping: dict[str, int],
+            barcode_header: str,
+            header_row_index: int,
     ) -> set[tuple[int, int]]:
         barcode_col = header_mapping.get(barcode_header)
         if barcode_col is None:
@@ -474,7 +748,7 @@ class SyncService:
 
         rows_by_barcode: dict[str, list[int]] = {}
         for i in range(header_row_index, len(data)):
-            value = _cell(data[i], barcode_col).strip()
+            value = _normalized_identifier(_cell(data[i], barcode_col))
             if not value:
                 continue
             rows_by_barcode.setdefault(value, []).append(i)
@@ -489,19 +763,19 @@ class SyncService:
 
     @staticmethod
     def _build_style_updates(
-        include_coloring: bool,
-        sheets_client: SheetsClient,
-        spreadsheet_url: str,
-        sheet_name: str,
-        working_data: list[list],
-        target_header_mapping: dict[str, int],
-        target_header_row_index: int,
-        barcode_col_target: int,
-        target_mapping: dict[str, str],
-        target_color_range: str | None,
-        orange_cells: set[tuple[int, int]],
-        missing_cells: set[tuple[int, int]],
-        duplicate_cells: set[tuple[int, int]],
+            include_coloring: bool,
+            sheets_client: SheetsClient,
+            spreadsheet_url: str,
+            sheet_name: str,
+            working_data: list[list],
+            target_header_mapping: dict[str, int],
+            target_header_row_index: int,
+            barcode_col_target: int,
+            target_mapping: dict[str, str],
+            target_color_range: str | None,
+            orange_cells: set[tuple[int, int]],
+            missing_cells: set[tuple[int, int]],
+            duplicate_cells: set[tuple[int, int]],
     ) -> StyleBuildResult:
         if not include_coloring:
             return StyleBuildResult(
@@ -649,13 +923,6 @@ class SyncService:
         )
 
 
-def _cell(row: list, index: int) -> str:
-    if index < 0 or index >= len(row):
-        return ""
-    value = row[index]
-    return "" if value is None else str(value)
-
-
 def _max_col(mapping: dict[str, int]) -> int:
     return max(mapping.values()) if mapping else 0
 
@@ -689,3 +956,41 @@ def _a1_col_to_index(col: str) -> int:
     for ch in col:
         result = result * 26 + (ord(ch) - ord("A") + 1)
     return result - 1
+
+
+def _cell(row: list, index: int) -> str:
+    if index < 0 or index >= len(row):
+        return ""
+    value = row[index]
+    return "" if value is None else str(value)
+
+
+def _normalized_plain(value: str) -> str:
+    return value.strip()
+
+
+def _normalized_identifier(value: str) -> str:
+    if value is None:
+        return ""
+
+    result = str(value).replace("\u200b", "").replace("\ufeff", "").strip()
+
+    while result.startswith(("'", "’", "`")):
+        result = result[1:].lstrip()
+
+    return result
+
+
+def _normalize_by_header(header_name: str, value: str) -> str:
+    if header_name in {"BARCODE", "Баркод", "ШК", "Артикул"}:
+        return _normalized_identifier(value)
+    return _normalized_plain(value)
+
+def _to_sheet_number_if_possible(value: str):
+    normalized = _normalized_identifier(value)
+    if normalized.isdigit():
+        try:
+            return int(normalized)
+        except ValueError:
+            return normalized
+    return normalized
